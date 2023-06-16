@@ -15,15 +15,49 @@
 #include "esp_log.h"
 #include "driver/pulse_cnt.h"
 
+#include "esp_timer.h"
+
+#include "driver/ledc.h"
+
+#include "button.h"
+
 // SDA - GPIO21
 #define PIN_SDA 22
 
 // SCL - GPIO22
 #define PIN_SCL 23
 
+#define PIN_ENCODER_A 18
+#define PIN_ENCODER_B 19
+#define PIN_ENCODER_KEY 21
+
+#define PIN_KEY1 34
+#define PIN_KEY2 35
+
+#define PIN_OUT_PWM1 17
+#define PIN_OUT_PWM2 16
+
 static const char *TAG = "DualPWM ";
 
-int freq = 1000;
+int freq = 10;    // Hz
+int duty1 = 50;   //%
+int duty2 = 50;   //%
+int offset2 = 25; //%
+
+bool start = false;
+
+int top = 0;
+
+char buf[32];
+
+const int lines = 5;
+
+#define LEDC_TIMER LEDC_TIMER_0
+#define LEDC_MODE LEDC_LOW_SPEED_MODE
+#define LEDC_DUTY_RES LEDC_TIMER_10_BIT    // Set duty resolution to 10 bits
+#define LEDC_DUTY (2 * *LEDC_DUTY_RES - 1) // Set duty to 50%.
+
+static QueueHandle_t gpio_evt_queue = NULL;
 
 static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata, void *user_ctx)
 {
@@ -32,6 +66,147 @@ static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_even
   // send event data to queue, from this interrupt callback
   xQueueSendFromISR(queue, &(edata->watch_point_value), &high_task_wakeup);
   return (high_task_wakeup == pdTRUE);
+}
+
+static void ledc_init(void)
+{
+  // Prepare and then apply the LEDC PWM timer configuration
+  ledc_timer_config_t ledc_timer = {
+      .speed_mode = LEDC_MODE,
+      .timer_num = LEDC_TIMER,
+      .duty_resolution = LEDC_DUTY_RES,
+      .freq_hz = freq,
+      .clk_cfg = LEDC_AUTO_CLK};
+  ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+  // Prepare and then apply the LEDC PWM channel configuration
+  ledc_channel_config_t ledc_channel1 = {
+      .speed_mode = LEDC_MODE,
+      .channel = LEDC_CHANNEL_0,
+      .timer_sel = LEDC_TIMER,
+      .intr_type = LEDC_INTR_DISABLE,
+      .gpio_num = PIN_OUT_PWM1,
+      .duty = 0, // Set duty to 0%
+      .hpoint = 0};
+  ledc_channel_config_t ledc_channel2 = {
+      .speed_mode = LEDC_MODE,
+      .channel = LEDC_CHANNEL_1,
+      .timer_sel = LEDC_TIMER,
+      .intr_type = LEDC_INTR_DISABLE,
+      .gpio_num = PIN_OUT_PWM2,
+      .duty = 0, // Set duty to 0%
+      .hpoint = 0};
+  ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel1));
+  ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel2));
+}
+
+/*
+selector - 1..99 - Выбор пункта меню, 100..199 - редактирование пункта
+*/
+void drawMenu(u8g2_t *ptr_u8g2, int selector)
+{
+  int ypos = 0;
+  int yheight = u8g2_GetDisplayHeight(ptr_u8g2) / lines;
+  int w = 0;
+  u8g2_ClearBuffer(ptr_u8g2);
+
+  // 1
+  if (selector == 1)
+    u8g2_DrawBox(ptr_u8g2, 0, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+
+  u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "FREQ: ");
+
+  snprintf(buf, sizeof(buf), " %d Hz", freq);
+  w = u8g2_GetStrWidth(ptr_u8g2, buf);
+
+  if (selector == 101)
+  {
+    u8g2_DrawBox(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 2, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+  }
+  u8g2_DrawStr(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 1, ypos + yheight, buf);
+
+  ypos += yheight;
+  // 2
+  if (selector == 2)
+    u8g2_DrawBox(ptr_u8g2, 0, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+
+  u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "1 Duty: ");
+
+  snprintf(buf, sizeof(buf), " %d%%", duty1);
+  w = u8g2_GetStrWidth(ptr_u8g2, buf);
+
+  if (selector == 102)
+  {
+    u8g2_DrawBox(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 2, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+  }
+  u8g2_DrawStr(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 1, ypos + yheight, buf);
+
+  ypos += yheight;
+  // 3
+  if (selector == 3)
+    u8g2_DrawBox(ptr_u8g2, 0, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+
+  u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "2 Duty: ");
+
+  snprintf(buf, sizeof(buf), " %d%%", duty2);
+  w = u8g2_GetStrWidth(ptr_u8g2, buf);
+
+  if (selector == 103)
+  {
+    u8g2_DrawBox(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 2, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+  }
+  u8g2_DrawStr(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 1, ypos + yheight, buf);
+
+  ypos += yheight;
+  // 4
+  if (selector == 4)
+    u8g2_DrawBox(ptr_u8g2, 0, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+
+  u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "2 Offset: ");
+
+  snprintf(buf, sizeof(buf), " %d%%", offset2);
+  w = u8g2_GetStrWidth(ptr_u8g2, buf);
+
+  if (selector == 104)
+  {
+    u8g2_DrawBox(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 2, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+  }
+  u8g2_DrawStr(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 1, ypos + yheight, buf);
+
+  ypos += yheight;
+  // 5
+  if (selector == 5)
+    u8g2_DrawBox(ptr_u8g2, 0, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+
+  if (start == false)
+  {
+    u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "START");
+    snprintf(buf, sizeof(buf), "%s", "Off");
+  }
+  else
+  {
+    u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "STOP");
+    snprintf(buf, sizeof(buf), "%s", "ON");
+  }
+
+  w = u8g2_GetStrWidth(ptr_u8g2, buf);
+
+  if (selector != 5 && start == true)
+  {
+    u8g2_DrawBox(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 2, ypos + 1, u8g2_GetDisplayWidth(ptr_u8g2), yheight + 1);
+  }
+  u8g2_DrawStr(ptr_u8g2, u8g2_GetDisplayWidth(ptr_u8g2) - w - 1, ypos + yheight, buf);
+
+  u8g2_SendBuffer(ptr_u8g2);
+}
+
+static void IRAM_ATTR gpio_isr_handler(void *arg)
+{
+  uint32_t gpio_num = (uint32_t)arg;
+  static int64_t key_millis = 0;
+  if (esp_timer_get_time() - key_millis > 150000)
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+  key_millis = esp_timer_get_time();
 }
 
 void app_main(void *ignore)
@@ -63,6 +238,8 @@ void app_main(void *ignore)
   //  u8g2_DrawFrame(&u8g2, 0, 26, 100, 6);
 
   u8g2_SetFont(&u8g2, u8g2_font_8x13_tf);
+  u8g2_SetFontMode(&u8g2, 1);  /* activate transparent font mode */
+  u8g2_SetDrawColor(&u8g2, 2); /* XOR */
 
   u8g2_SendBuffer(&u8g2);
 
@@ -84,14 +261,14 @@ void app_main(void *ignore)
 
   ESP_LOGI(TAG, "install pcnt channels");
   pcnt_chan_config_t chan_a_config = {
-      .edge_gpio_num = 19,
-      .level_gpio_num = 18,
+      .edge_gpio_num = PIN_ENCODER_B,
+      .level_gpio_num = PIN_ENCODER_A,
   };
   pcnt_channel_handle_t pcnt_chan_a = NULL;
   ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_a_config, &pcnt_chan_a));
   pcnt_chan_config_t chan_b_config = {
-      .edge_gpio_num = 18,
-      .level_gpio_num = 19,
+      .edge_gpio_num = PIN_ENCODER_A,
+      .level_gpio_num = PIN_ENCODER_B,
   };
   pcnt_channel_handle_t pcnt_chan_b = NULL;
   ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_b_config, &pcnt_chan_b));
@@ -125,47 +302,202 @@ void app_main(void *ignore)
   ESP_LOGI(TAG, "start pcnt unit");
   ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
 
+  // Set the LEDC peripheral configuration
+  ledc_init();
+  // Set duty to 50%
+  ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, 0, 0));
+  // Update duty to apply the new value
+  ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, 0, 0));
+
+  ledc_stop(LEDC_MODE, LEDC_CHANNEL_0, 0);
+  ledc_stop(LEDC_MODE, LEDC_CHANNEL_1, 0);
+
   // Report counter value
-  int pulse_count = 0;
   // int event_count = 0;
-  char buf[32];
+  bool display_update = true;
+  int64_t millis = 0;
+  int64_t deltamillis = 0;
+  int remainder_pcnt = 0;
+
+  int selector = 5;
+  int cur_value = 0;
+
+  button_event_t ev;
+  QueueHandle_t button_events = button_init(PIN_BIT(PIN_KEY1) | PIN_BIT(PIN_KEY2) | PIN_BIT(PIN_ENCODER_KEY));
+
   while (1)
   {
-    /*    if (xQueueReceive(queue, &event_count, pdMS_TO_TICKS(1000)))
-        {
-          ESP_LOGI(TAG, "Watch point event, count: %d", event_count);
-        }
-        else
-    */
+    // Key press
+    if (xQueueReceive(button_events, &ev, 200 / portTICK_PERIOD_MS))
     {
-      u8g2_ClearBuffer(&u8g2);
-      //  ESP_LOGI(TAG, "u8g2_DrawBox");
-      //  u8g2_DrawBox(&u8g2, 0, 26, 80, 6);
-      //  u8g2_DrawFrame(&u8g2, 0, 26, 100, 6);
+      if ((ev.pin == PIN_ENCODER_KEY) && (ev.event == BUTTON_DOWN))
+      {
+        if (selector < 99)
+        {
+          selector += 100;
+          switch (selector)
+          {
+          case 101:
+            cur_value = freq;
+            break;
+          case 102:
+            cur_value = duty1;
+            break;
+          case 103:
+            cur_value = duty2;
+            break;
+          case 104:
+            cur_value = offset2;
+            break;
+          case 105:
+            selector = 5;
+            if (start)
+            {
+              ESP_ERROR_CHECK(ledc_stop(LEDC_MODE, LEDC_CHANNEL_0, 0));
+              ESP_ERROR_CHECK(ledc_stop(LEDC_MODE, LEDC_CHANNEL_1, 0));
+              start = false;
+            }
+            else
+            {
+              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, 1023 * duty1 / 100, 0));
+              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, 1023 * duty2 / 100, 1023 * offset2 / 100));
+              ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0));
+              ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_1));
+              start = true;
+            }
+            break;
 
-      ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
-
-      if (abs(pulse_count) >= 4)
-        ESP_LOGI(TAG, "Pulse count: %d", pulse_count);
-
-      if (abs(pulse_count) >= 4)
-        ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
-
-      if (abs(pulse_count) > 26)
-        // freq = freq + pulse_count / 4 * 100;
-        freq = freq * 2;
-      else if (abs(pulse_count) > 16)
-        freq = freq + (freq / 100) * (pulse_count / 4);
-      else
-        freq = freq + pulse_count / 4;
-
-      snprintf(buf, sizeof(buf), "FREQ: %d", freq);
-      u8g2_DrawStr(&u8g2, 2, 17, buf);
-
-      u8g2_SendBuffer(&u8g2);
-
-      // ESP_LOGI(TAG, "Pulse count: %d", pulse_count);
-      vTaskDelay(100 / portTICK_PERIOD_MS);
+          default:
+            break;
+          }
+        }
+        else if (selector < 199)
+        {
+          selector -= 100;
+          ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0));
+          ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_1));
+        }
+      }
+      display_update = true;
     }
+
+    int pulse_count = 0;
+    int pulse_count_norm = 0;
+    ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
+
+    deltamillis = esp_timer_get_time() - millis;
+    millis = esp_timer_get_time();
+
+    pulse_count_norm = (pulse_count + remainder_pcnt) / 4;
+    remainder_pcnt = (pulse_count + remainder_pcnt) % 4;
+
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
+
+    if (ev.event)
+      pulse_count_norm = 0;
+
+    // Encoder rotate
+    if (pulse_count_norm != 0)
+    {
+      int rotate_speed = (abs(pulse_count_norm) * 1000) / (deltamillis / 1000); // clicks per second
+
+      ESP_LOGI(TAG, "Pulse count: %d speed %d", pulse_count_norm, rotate_speed);
+
+      int d = pulse_count_norm;
+
+      // Меню
+      if (selector < 99)
+      {
+        selector += d;
+        if (selector > lines)
+          selector = lines;
+        if (selector < 1)
+          selector = 1;
+      }
+      else if (selector > 99)
+      {
+        // ускорение 10%
+        if (rotate_speed > 20)
+        {
+          d = (cur_value / 10) * pulse_count_norm;
+          if (d != 0)
+            rotate_speed = 0;
+        }
+
+        // ускорение 1%
+        if (rotate_speed > 10)
+        {
+          d = (cur_value / 100) * pulse_count_norm;
+          if (d == 0)
+            d = pulse_count_norm;
+        }
+      }
+
+      ESP_LOGI(TAG, "cur_value: %d add %d", cur_value, d);
+      cur_value = cur_value + d;
+
+      // меняем настройки
+      switch (selector)
+      {
+      case 101:
+        if (cur_value < 1)
+          cur_value = 1;
+
+        if (ledc_set_freq(LEDC_MODE, LEDC_TIMER, cur_value) == ESP_OK)
+        {
+          // freq = ledc_get_freq(LEDC_MODE, LEDC_TIMER);
+          freq = cur_value;
+        }
+        break;
+      case 102:
+        if (cur_value < 0)
+          cur_value = 0;
+        if (cur_value > 100)
+          cur_value = 100;
+
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, 1023 * cur_value / 100, 0) == ESP_OK)
+        {
+          // v = ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_0);
+          duty1 = cur_value;
+        }
+        break;
+      case 103:
+        if (cur_value < 0)
+          cur_value = 0;
+        if (cur_value > 100)
+          cur_value = 100;
+
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, 1023 * cur_value / 100, 1023 * offset2 / 100) == ESP_OK)
+        {
+          // v = ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_1);
+          duty2 = cur_value;
+        }
+        break;
+      case 104:
+        if (cur_value < 0)
+          cur_value = 0;
+        if (cur_value > 100)
+          cur_value = 100;
+
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, 1023 * duty2 / 100, 1023 * cur_value / 100) == ESP_OK)
+        {
+          // v = ledc_get_hpoint(LEDC_MODE, LEDC_CHANNEL_1);
+          offset2 = cur_value;
+        }
+        break;
+
+      default:
+        break;
+      }
+      display_update = true;
+    }
+
+    if (display_update)
+    {
+      drawMenu(&u8g2, selector);
+      display_update = false;
+    }
+
+    ev.event = 0;
   }
 }
