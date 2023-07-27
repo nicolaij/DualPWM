@@ -39,7 +39,8 @@
 
 static const char *TAG = "DualPWM ";
 
-int freq = 10;    // Hz
+int freq = 10; // Hz
+bool hi_mode = false;
 int duty1 = 50;   //%
 int duty2 = 50;   //%
 int offset2 = 25; //%
@@ -52,10 +53,14 @@ char buf[32];
 
 const int lines = 5;
 
+#include <math.h>
+
 #define LEDC_TIMER LEDC_TIMER_0
-#define LEDC_MODE LEDC_LOW_SPEED_MODE
-#define LEDC_DUTY_RES LEDC_TIMER_10_BIT    // Set duty resolution to 10 bits
-#define LEDC_DUTY (2 * *LEDC_DUTY_RES - 1) // Set duty to 50%.
+#define LEDC_MODE LEDC_HIGH_SPEED_MODE
+#define LEDC_DUTY_RES_LO_FREQ LEDC_TIMER_10_BIT // Set duty resolution bits
+#define LEDC_DUTY_MAX_LO_FREQ 1023
+#define LEDC_DUTY_RES_HI_FREQ LEDC_TIMER_8_BIT // Set duty resolution bits
+#define LEDC_DUTY_MAX_HI_FREQ 255
 
 static QueueHandle_t gpio_evt_queue = NULL;
 
@@ -68,17 +73,19 @@ static bool example_pcnt_on_reach(pcnt_unit_handle_t unit, const pcnt_watch_even
   return (high_task_wakeup == pdTRUE);
 }
 
-static void ledc_init(void)
+static void ledc_timer_init()
 {
-  // Prepare and then apply the LEDC PWM timer configuration
   ledc_timer_config_t ledc_timer = {
-      .speed_mode = LEDC_MODE,
+      .speed_mode = LEDC_HIGH_SPEED_MODE,
       .timer_num = LEDC_TIMER,
-      .duty_resolution = LEDC_DUTY_RES,
+      .duty_resolution = (hi_mode == true) ? LEDC_DUTY_RES_HI_FREQ : LEDC_DUTY_RES_LO_FREQ,
       .freq_hz = freq,
-      .clk_cfg = LEDC_AUTO_CLK};
+      .clk_cfg = (hi_mode == true) ? LEDC_USE_APB_CLK : LEDC_USE_REF_TICK};
   ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+}
 
+static void ledc_channel_init()
+{
   // Prepare and then apply the LEDC PWM channel configuration
   ledc_channel_config_t ledc_channel1 = {
       .speed_mode = LEDC_MODE,
@@ -116,7 +123,11 @@ void drawMenu(u8g2_t *ptr_u8g2, int selector)
 
   u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "FREQ: ");
 
-  snprintf(buf, sizeof(buf), " %d Hz", freq);
+  if (hi_mode)
+    snprintf(buf, sizeof(buf), " %d kHz", freq / 1000);
+  else
+    snprintf(buf, sizeof(buf), " %d Hz", freq);
+
   w = u8g2_GetStrWidth(ptr_u8g2, buf);
 
   if (selector == 101)
@@ -207,6 +218,12 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
   if (esp_timer_get_time() - key_millis > 150000)
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
   key_millis = esp_timer_get_time();
+}
+
+void stopPWM()
+{
+  ESP_ERROR_CHECK(ledc_stop(LEDC_MODE, LEDC_CHANNEL_0, 0));
+  ESP_ERROR_CHECK(ledc_stop(LEDC_MODE, LEDC_CHANNEL_1, 0));
 }
 
 void app_main(void *ignore)
@@ -303,14 +320,14 @@ void app_main(void *ignore)
   ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
 
   // Set the LEDC peripheral configuration
-  ledc_init();
+  ledc_timer_init();
+  ledc_channel_init();
   // Set duty to 50%
   ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, 0, 0));
   // Update duty to apply the new value
   ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, 0, 0));
 
-  ledc_stop(LEDC_MODE, LEDC_CHANNEL_0, 0);
-  ledc_stop(LEDC_MODE, LEDC_CHANNEL_1, 0);
+  stopPWM();
 
   // Report counter value
   // int event_count = 0;
@@ -321,6 +338,8 @@ void app_main(void *ignore)
 
   int selector = 5;
   int cur_value = 0;
+
+  int res = LEDC_DUTY_MAX_LO_FREQ;
 
   button_event_t ev;
   QueueHandle_t button_events = button_init(PIN_BIT(PIN_KEY1) | PIN_BIT(PIN_KEY2) | PIN_BIT(PIN_ENCODER_KEY));
@@ -353,14 +372,20 @@ void app_main(void *ignore)
             selector = 5;
             if (start)
             {
-              ESP_ERROR_CHECK(ledc_stop(LEDC_MODE, LEDC_CHANNEL_0, 0));
-              ESP_ERROR_CHECK(ledc_stop(LEDC_MODE, LEDC_CHANNEL_1, 0));
+              stopPWM();
               start = false;
             }
             else
             {
-              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, 1023 * duty1 / 100, 0));
-              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, 1023 * duty2 / 100, 1023 * offset2 / 100));
+              if (hi_mode)
+                res = LEDC_DUTY_MAX_HI_FREQ;
+              else
+                res = LEDC_DUTY_MAX_LO_FREQ;
+
+              ledc_timer_init();
+              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, res * duty1 / 100, 0));
+              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, res * duty2 / 100, res * offset2 / 100));
+
               ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0));
               ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_1));
               start = true;
@@ -416,21 +441,27 @@ void app_main(void *ignore)
       }
       else if (selector > 99)
       {
-        // ускорение 10%
-        if (rotate_speed > 20)
-        {
-          d = (cur_value / 10) * pulse_count_norm;
-          if (d != 0)
-            rotate_speed = 0;
-        }
+        // ускорение 5%
+        //        if (rotate_speed > 20)
+        //        {
+        //          d = (cur_value / 20) * pulse_count_norm;
+        //          if (d != 0)
+        //            rotate_speed = 0;
+        //        }
 
-        // ускорение 1%
+        // ускорение x5
         if (rotate_speed > 10)
         {
-          d = (cur_value / 100) * pulse_count_norm;
+          d = pulse_count_norm * 10;
           if (d == 0)
             d = pulse_count_norm;
         }
+      }
+
+      if (hi_mode == true && selector == 101)
+      {
+        cur_value = (cur_value / 1000) * 1000;
+        d = d * 1000;
       }
 
       ESP_LOGI(TAG, "cur_value: %d add %d", cur_value, d);
@@ -443,11 +474,38 @@ void app_main(void *ignore)
         if (cur_value < 1)
           cur_value = 1;
 
-        if (ledc_set_freq(LEDC_MODE, LEDC_TIMER, cur_value) == ESP_OK)
+        if (hi_mode == true && cur_value <= 1000)
         {
-          // freq = ledc_get_freq(LEDC_MODE, LEDC_TIMER);
-          freq = cur_value;
+          cur_value = 900;
+          freq = 900;
         }
+
+        if (hi_mode == false && cur_value > 900)
+        {
+          cur_value = 1000;
+          freq = 1000;
+        }
+
+        if ((hi_mode == true && cur_value <= 1000) || (hi_mode == false && cur_value > 900))
+        {
+          printf("stop\n");
+          stopPWM();
+          start = false;
+          hi_mode = !hi_mode;
+          ledc_timer_init();
+        }
+        else
+        {
+          if (ledc_set_freq(LEDC_MODE, LEDC_TIMER, cur_value) == ESP_OK)
+          {
+            freq = cur_value;
+          }
+          else
+          {
+            cur_value = ledc_get_freq(LEDC_MODE, LEDC_TIMER);
+          }
+        }
+
         break;
       case 102:
         if (cur_value < 0)
@@ -455,7 +513,7 @@ void app_main(void *ignore)
         if (cur_value > 100)
           cur_value = 100;
 
-        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, 1023 * cur_value / 100, 0) == ESP_OK)
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, res * cur_value / 100, 0) == ESP_OK)
         {
           // v = ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_0);
           duty1 = cur_value;
@@ -467,7 +525,7 @@ void app_main(void *ignore)
         if (cur_value > 100)
           cur_value = 100;
 
-        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, 1023 * cur_value / 100, 1023 * offset2 / 100) == ESP_OK)
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, res * cur_value / 100, res * offset2 / 100) == ESP_OK)
         {
           // v = ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_1);
           duty2 = cur_value;
@@ -479,7 +537,7 @@ void app_main(void *ignore)
         if (cur_value > 100)
           cur_value = 100;
 
-        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, 1023 * duty2 / 100, 1023 * cur_value / 100) == ESP_OK)
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, res * duty2 / 100, res * cur_value / 100) == ESP_OK)
         {
           // v = ledc_get_hpoint(LEDC_MODE, LEDC_CHANNEL_1);
           offset2 = cur_value;
