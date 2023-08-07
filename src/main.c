@@ -41,9 +41,15 @@ static const char *TAG = "DualPWM ";
 
 int freq = 10; // Hz
 bool hi_mode = false;
-int duty1 = 50;   //%
-int duty2 = 50;   //%
-int offset2 = 25; //%
+
+double duty1 = 50.0;   // %
+double duty2 = 50.0;   // %
+double offset2 = 25.0; // %
+
+// real
+int duty1r = 0;
+int duty2r = 0;
+int offset2r = 0;
 
 bool start = false;
 
@@ -59,8 +65,8 @@ const int lines = 5;
 #define LEDC_MODE LEDC_HIGH_SPEED_MODE
 #define LEDC_DUTY_RES_LO_FREQ LEDC_TIMER_10_BIT // Set duty resolution bits
 #define LEDC_DUTY_MAX_LO_FREQ 1023
-#define LEDC_DUTY_RES_HI_FREQ LEDC_TIMER_8_BIT // Set duty resolution bits
-#define LEDC_DUTY_MAX_HI_FREQ 255
+#define LEDC_DUTY_RES_HI_FREQ LEDC_TIMER_9_BIT // Set duty resolution bits
+#define LEDC_DUTY_MAX_HI_FREQ 511
 
 static QueueHandle_t gpio_evt_queue = NULL;
 
@@ -143,7 +149,7 @@ void drawMenu(u8g2_t *ptr_u8g2, int selector)
 
   u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "1 Duty: ");
 
-  snprintf(buf, sizeof(buf), " %d%%", duty1);
+  snprintf(buf, sizeof(buf), "%3.1f%%", duty1);
   w = u8g2_GetStrWidth(ptr_u8g2, buf);
 
   if (selector == 102)
@@ -159,7 +165,8 @@ void drawMenu(u8g2_t *ptr_u8g2, int selector)
 
   u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "2 Duty: ");
 
-  snprintf(buf, sizeof(buf), " %d%%", duty2);
+  snprintf(buf, sizeof(buf), "%3.1f%%", duty2);
+
   w = u8g2_GetStrWidth(ptr_u8g2, buf);
 
   if (selector == 103)
@@ -175,7 +182,8 @@ void drawMenu(u8g2_t *ptr_u8g2, int selector)
 
   u8g2_DrawStr(ptr_u8g2, 2, ypos + yheight, "2 Offset: ");
 
-  snprintf(buf, sizeof(buf), " %d%%", offset2);
+  snprintf(buf, sizeof(buf), "%3.1f%%", offset2);
+
   w = u8g2_GetStrWidth(ptr_u8g2, buf);
 
   if (selector == 104)
@@ -360,13 +368,13 @@ void app_main(void *ignore)
             cur_value = freq;
             break;
           case 102:
-            cur_value = duty1;
+            cur_value = duty1 * 10.0;
             break;
           case 103:
-            cur_value = duty2;
+            cur_value = duty2 * 10.0;
             break;
           case 104:
-            cur_value = offset2;
+            cur_value = offset2 * 10.0;
             break;
           case 105:
             selector = 5;
@@ -383,12 +391,25 @@ void app_main(void *ignore)
                 res = LEDC_DUTY_MAX_LO_FREQ;
 
               ledc_timer_init();
-              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, res * duty1 / 100, 0));
-              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, res * duty2 / 100, res * offset2 / 100));
+              duty1r = res * duty1;
+              duty2r = res * duty2;
+              offset2r = res * offset2;
+              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, duty1r, 0));
+              ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, duty2r, offset2r));
+              ESP_LOGI(TAG, "Duty1: %d", duty1r);
+              ESP_LOGI(TAG, "Duty2: %d", duty2r);
+              ESP_LOGI(TAG, "Offset2: %d", offset2r);
 
               ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0));
               ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_1));
               start = true;
+
+              duty1r = (ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_0));
+              duty2r = (ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_1));
+              offset2r = (ledc_get_hpoint(LEDC_MODE, LEDC_CHANNEL_1));
+              ESP_LOGI(TAG, "Get Duty1: %d", duty1r);
+              ESP_LOGI(TAG, "Get Duty2: %d", duty2r);
+              ESP_LOGI(TAG, "Get Offset2: %d", offset2r);
             }
             break;
 
@@ -464,6 +485,11 @@ void app_main(void *ignore)
         d = d * 1000;
       }
 
+      if (selector >= 102 && selector <= 104)
+      {
+        d = d * 2;
+      }
+
       ESP_LOGI(TAG, "cur_value: %d add %d", cur_value, d);
       cur_value = cur_value + d;
 
@@ -510,37 +536,37 @@ void app_main(void *ignore)
       case 102:
         if (cur_value < 0)
           cur_value = 0;
-        if (cur_value > 100)
-          cur_value = 100;
+        if (cur_value > 1000)
+          cur_value = 1000;
 
-        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, res * cur_value / 100, 0) == ESP_OK)
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, res * (double)(cur_value / 10.0), 0) == ESP_OK)
         {
           // v = ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_0);
-          duty1 = cur_value;
+          duty1 = cur_value / 10.0;
         }
         break;
       case 103:
         if (cur_value < 0)
           cur_value = 0;
-        if (cur_value > 100)
-          cur_value = 100;
+        if (cur_value > 1000)
+          cur_value = 1000;
 
-        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, res * cur_value / 100, res * offset2 / 100) == ESP_OK)
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, res * (double)(cur_value / 10.0), res * offset2) == ESP_OK)
         {
           // v = ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_1);
-          duty2 = cur_value;
+          duty2 = cur_value / 10.0;
         }
         break;
       case 104:
         if (cur_value < 0)
           cur_value = 0;
-        if (cur_value > 100)
-          cur_value = 100;
+        if (cur_value > 1000)
+          cur_value = 1000;
 
-        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, res * duty2 / 100, res * cur_value / 100) == ESP_OK)
+        if (ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, res * duty2, res * (double)(cur_value / 10.0)) == ESP_OK)
         {
           // v = ledc_get_hpoint(LEDC_MODE, LEDC_CHANNEL_1);
-          offset2 = cur_value;
+          offset2 = cur_value / 10.0;
         }
         break;
 
