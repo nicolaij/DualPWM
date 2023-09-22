@@ -391,9 +391,9 @@ void app_main(void *ignore)
                 res = LEDC_DUTY_MAX_LO_FREQ;
 
               ledc_timer_init();
-              duty1r = res * duty1;
-              duty2r = res * duty2;
-              offset2r = res * offset2;
+              duty1r = res * duty1 / 100;
+              duty2r = res * duty2 / 100;
+              offset2r = res * offset2 / 100;
               ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_0, duty1r, 0));
               ESP_ERROR_CHECK(ledc_set_duty_with_hpoint(LEDC_MODE, LEDC_CHANNEL_1, duty2r, offset2r));
               ESP_LOGI(TAG, "Duty1: %d", duty1r);
